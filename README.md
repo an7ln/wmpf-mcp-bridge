@@ -56,10 +56,13 @@ tool_timeout_sec = 60
 
 - `status`：查看 MCP 和 CDP 连接状态。
 - `connect_wmpf`：连接本机 WMPFDebugger CDP WebSocket，并启用 Runtime/Network。
-- `cdp_call`：调用任意 CDP 方法。
+- `select_appservice_context`：自动枚举 Target、flatten attach，并选择包含 `wx.request` / `require` / `getCurrentPages` 的 appservice Runtime context。
+- `cdp_call`：调用任意 CDP 方法，支持传入 flatten `sessionId`。
+- `cdp_call_target`：对指定 `targetId` 自动 `Target.attachToTarget({ flatten: true })` 后在子 session 中调用 CDP。
 - `runtime_eval`：在当前 Runtime 执行 JS。
+- `runtime_eval_appservice`：在自动选择的 appservice Runtime context 中执行 JS。
 - `network_enable`：启用 CDP Network。
-- `get_recent_requests`：读取最近 CDP Network 事件。
+- `get_recent_requests`：读取最近 CDP Network 请求，支持 `domain`、`pathPrefix`、`keyword`、`excludeStatic`、`compact` 过滤。
 - `get_response_body`：尝试读取 CDP 响应体。
 - `get_recent_console`：读取 console 和 exception 事件。
 
@@ -77,7 +80,7 @@ tool_timeout_sec = 60
 
 ### 网络采集与接口资产
 
-- `hook_wx_request`：注入非破坏性 `wx.request` hook。
+- `hook_wx_request`：自动选择 appservice context 后注入非破坏性 `wx.request` hook。
 - `hook_fetch_and_xhr`：注入非破坏性 fetch/XHR hook，记录响应和调用栈。
 - `get_hooked_requests`：读取 fetch/XHR hook 记录。
 - `get_all_requests`：汇总 CDP、wx.request、fetch/XHR 请求，并统一格式。
@@ -106,6 +109,12 @@ tool_timeout_sec = 60
 - `search_runtime_keywords`：搜索 window keys、document HTML、script 文本、storage 和已抓请求。
 - `trace_request_callstack`：从 hook 记录中提取发起请求的 JS 调用栈。
 
+### 状态篡改/复原辅助
+
+- `inspect_vuex_store`：在 appservice context 中查找 Vuex-like store，保存原始 state 快照，并返回 state/mutations/actions 摘要。
+- `patch_vuex_state`：按 path 修改 state 或调用 mutation。默认 `dryRun=true`，只有 `dryRun=false` 且 `requireConfirm=true` 才会修改本地 Runtime 状态。
+- `restore_vuex_state`：从 `inspect_vuex_store` 保存的快照恢复 state。默认 `dryRun=true`，只有 `dryRun=false` 且 `requireConfirm=true` 才会恢复。
+
 ### 报告与证据
 
 - `export_session`：导出当前会话 JSON 到 `reports/session-*.json`。
@@ -117,11 +126,14 @@ tool_timeout_sec = 60
 1. 启动 WMPFDebugger 并确认 DevTools 可连接 `ws=127.0.0.1:62000`。
 2. 启动本项目并把启动输出的 MCP URL 配入 Codex。
 3. 调用 `connect_wmpf`。
-4. 调用 `hook_wx_request` 和 `hook_fetch_and_xhr`。
-5. 在小程序中人工操作登录、搜索、下单前流程、个人中心、地址、优惠券、上传等页面。
-6. 调用 `get_api_inventory` 和各类 `find_*` 工具生成线索。
-7. 对候选接口使用 `build_replay_plan`、`compare_two_requests`、`passive_param_fuzz_suggestions` 制定人工验证步骤。
-8. 调用 `export_session` 和 `generate_security_notes` 保存证据与笔记。
+4. 调用 `select_appservice_context`，确认选中的 context 包含 `wx.request` / `require`。
+5. 调用 `hook_wx_request` 和 `hook_fetch_and_xhr`。
+6. 在小程序中人工操作登录、搜索、下单前流程、个人中心、地址、优惠券、上传等页面。
+7. 使用 `get_recent_requests` 的 `excludeStatic=true`、`domain`、`pathPrefix` 过滤图片、字体、data URI 等噪声。
+8. 调用 `get_api_inventory` 和各类 `find_*` 工具生成线索。
+9. 对候选接口使用 `build_replay_plan`、`compare_two_requests`、`passive_param_fuzz_suggestions` 制定人工验证步骤。
+10. 如需验证前端状态授权绕过，先调用 `inspect_vuex_store` 保存快照，再用 `patch_vuex_state` dry-run 预览；确认后才设置 `dryRun=false` 和 `requireConfirm=true`。结束后用 `restore_vuex_state` 复原。
+11. 调用 `export_session` 和 `generate_security_notes` 保存证据与笔记。
 
 ## 构建
 

@@ -6,13 +6,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { CapturedCdpEvent, DEFAULT_CDP_WS_URL, WmpfCdpClient } from "./cdp.js";
+import { CapturedExecutionContext, DEFAULT_CDP_WS_URL, WmpfCdpClient } from "./cdp.js";
 
 const DEFAULT_MCP_PORT = 43_827;
 const DEFAULT_MAX_LENGTH = 20_000;
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? `${DEFAULT_MCP_PORT}`, 10);
 const MCP_TOKEN = process.env.MCP_TOKEN ?? crypto.randomBytes(24).toString("hex");
 const cdp = new WmpfCdpClient();
+const attachedTargets = new Map<string, string>();
+let selectedAppservice: AppserviceSelection | undefined;
 
 type JsonObject = Record<string, unknown>;
 type RequestSource = "cdp" | "wx" | "fetch" | "xhr";
@@ -43,6 +45,24 @@ interface RequestFilters {
   keyword?: string;
   domain?: string;
   pathPrefix?: string;
+}
+
+interface TargetInfo {
+  targetId: string;
+  type?: string;
+  title?: string;
+  url?: string;
+  attached?: boolean;
+}
+
+interface AppserviceSelection {
+  targetId: string;
+  sessionId: string;
+  contextId: number;
+  targetInfo: TargetInfo;
+  context: CapturedExecutionContext;
+  probe: JsonObject;
+  score: number;
 }
 
 const DEFAULT_KEYWORDS = [
@@ -151,6 +171,180 @@ async function evalJson<T = unknown>(
   }
 
   return remoteObject as T;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function remoteObjectValue<T = unknown>(result: JsonObject): T {
+  const remoteObject = result.result as
+    | {
+        value?: T;
+        unserializableValue?: string;
+        objectId?: string;
+        description?: string;
+      }
+    | undefined;
+
+  if (!remoteObject) {
+    return result as T;
+  }
+
+  if ("value" in remoteObject) {
+    return remoteObject.value as T;
+  }
+
+  return remoteObject as T;
+}
+
+async function attachToTarget(targetId: string): Promise<string> {
+  const existing = attachedTargets.get(targetId);
+  if (existing) {
+    return existing;
+  }
+
+  const attached = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+  const sessionId = String(attached.sessionId ?? "");
+  if (!sessionId) {
+    throw new Error(`Target.attachToTarget returned no sessionId for ${targetId}`);
+  }
+
+  attachedTargets.set(targetId, sessionId);
+  return sessionId;
+}
+
+async function getTargets(): Promise<TargetInfo[]> {
+  requireCdpConnected();
+  const result = await cdp.send("Target.getTargets");
+  const targetInfos = Array.isArray(result.targetInfos) ? result.targetInfos : [];
+  return targetInfos
+    .filter(isRecord)
+    .map(item => ({
+      targetId: String(item.targetId ?? ""),
+      type: typeof item.type === "string" ? item.type : undefined,
+      title: typeof item.title === "string" ? item.title : undefined,
+      url: typeof item.url === "string" ? item.url : undefined,
+      attached: typeof item.attached === "boolean" ? item.attached : undefined
+    }))
+    .filter(item => item.targetId);
+}
+
+function scoreTarget(target: TargetInfo): number {
+  const text = `${target.type ?? ""} ${target.title ?? ""} ${target.url ?? ""}`.toLowerCase();
+  let score = 0;
+  if (/appservice|service|worker|jscontext/.test(text)) score += 8;
+  if (/app|wx|miniprogram|miniapp/.test(text)) score += 3;
+  if (target.type && !["page", "iframe"].includes(target.type)) score += 2;
+  return score;
+}
+
+function scoreProbe(probe: JsonObject): number {
+  let score = 0;
+  if (probe.hasWxRequest === true) score += 10;
+  if (probe.hasWx === true) score += 4;
+  if (probe.hasRequire === true) score += 6;
+  if (probe.hasGetCurrentPages === true) score += 4;
+  if (probe.hasApp === true) score += 2;
+  if (probe.hasVuexStore === true) score += 5;
+  return score;
+}
+
+async function probeRuntimeContext(target: TargetInfo, sessionId: string, context: CapturedExecutionContext): Promise<AppserviceSelection | undefined> {
+  try {
+    const result = await cdp.send(
+      "Runtime.evaluate",
+      {
+        contextId: context.id,
+        returnByValue: true,
+        awaitPromise: true,
+        expression: `(() => {
+          const out = {
+            hasWx: typeof wx !== "undefined",
+            hasWxRequest: typeof wx !== "undefined" && typeof wx.request === "function",
+            hasRequire: typeof require === "function",
+            hasGetCurrentPages: typeof getCurrentPages === "function",
+            hasApp: typeof getApp === "function",
+            hasVuexStore: false,
+            windowKeys: typeof globalThis === "object" ? Object.keys(globalThis).filter(k => /wx|store|vue|app|route|config|request/i.test(k)).slice(0, 50) : []
+          };
+          try {
+            const store = typeof require === "function" ? require("store/index.js")?.store : null;
+            out.hasVuexStore = !!(store && store.state && store.commit);
+          } catch {}
+          return out;
+        })()`
+      },
+      DEFAULT_MAX_LENGTH,
+      sessionId
+    );
+    const probe = remoteObjectValue<JsonObject>(result);
+    const score = scoreTarget(target) + scoreProbe(probe);
+    if (score <= 0) {
+      return undefined;
+    }
+
+    return { targetId: target.targetId, sessionId, contextId: context.id, targetInfo: target, context, probe, score };
+  } catch {
+    return undefined;
+  }
+}
+
+async function selectAppserviceContext(force = false): Promise<AppserviceSelection> {
+  requireCdpConnected();
+  if (!force && selectedAppservice) {
+    return selectedAppservice;
+  }
+
+  const targets = (await getTargets()).sort((a, b) => scoreTarget(b) - scoreTarget(a));
+  const candidates: AppserviceSelection[] = [];
+
+  for (const target of targets) {
+    try {
+      const sessionId = await attachToTarget(target.targetId);
+      await cdp.send("Runtime.enable", {}, DEFAULT_MAX_LENGTH, sessionId).catch(() => ({}));
+      await sleep(250);
+      const contexts = cdp.getRuntimeContexts().filter(context => context.sessionId === sessionId);
+      for (const context of contexts) {
+        const candidate = await probeRuntimeContext(target, sessionId, context);
+        if (candidate) {
+          candidates.push(candidate);
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const selected = candidates[0];
+  if (!selected) {
+    throw new Error("No appservice-like Runtime execution context found. Try opening the mini program page first.");
+  }
+
+  selectedAppservice = selected;
+  return selected;
+}
+
+async function evalInAppservice<T = unknown>(expression: string, forceSelect = false): Promise<T> {
+  const selected = await selectAppserviceContext(forceSelect);
+  const result = await cdp.send(
+    "Runtime.evaluate",
+    {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+      contextId: selected.contextId
+    },
+    DEFAULT_MAX_LENGTH,
+    selected.sessionId
+  );
+
+  if (result.exceptionDetails) {
+    throw new Error(`Runtime.evaluate appservice exception: ${JSON.stringify(result.exceptionDetails)}`);
+  }
+
+  return remoteObjectValue<T>(result);
 }
 
 function js(value: unknown): string {
@@ -412,9 +606,20 @@ function buildCdpRequests(): NormalizedRequest[] {
   return [...grouped.values()].filter(req => req.url || req.path);
 }
 
-async function getHookArray(globalName: string): Promise<JsonObject[]> {
+async function getHookArray(globalName: string, preferAppservice = false): Promise<JsonObject[]> {
   if (!cdp.isConnected()) {
     return [];
+  }
+
+  if (preferAppservice) {
+    try {
+      const value = await evalInAppservice<unknown>(`(() => Array.isArray(globalThis.${globalName}) ? globalThis.${globalName}.slice(-300) : [])()`);
+      if (Array.isArray(value)) {
+        return value.filter(isRecord) as JsonObject[];
+      }
+    } catch {
+      // Fall back to the default page context below.
+    }
   }
 
   try {
@@ -502,8 +707,37 @@ function filterRequests(requests: NormalizedRequest[], filters: RequestFilters):
     .slice(-limit);
 }
 
+function isStaticNoiseRequest(req: NormalizedRequest): boolean {
+  const url = req.url.toLowerCase();
+  const headers = JSON.stringify(req.responseHeaders).toLowerCase();
+  return (
+    url.startsWith("data:") ||
+    /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|eot|map)(\?|#|$)/i.test(url) ||
+    /image\/|font\/|application\/font|octet-stream/.test(headers)
+  );
+}
+
+function compactRequest(req: NormalizedRequest): JsonObject {
+  return {
+    id: req.id,
+    source: req.source,
+    method: req.method,
+    url: req.url,
+    path: req.path,
+    query: sanitizeSensitive(req.query),
+    statusCode: req.statusCode,
+    requestHeaders: sanitizeSensitive(req.requestHeaders),
+    requestBodyPreview: toPreview(req.requestBodyRaw ?? req.requestBodyPreview, 2_000),
+    responseHeaders: sanitizeSensitive(req.responseHeaders),
+    responseBodyPreview: toPreview(req.responseBodyRaw ?? req.responseBodyPreview, 2_000),
+    durationMs: req.durationMs,
+    timestamp: req.timestamp,
+    cdpRequestId: req.cdpRequestId
+  };
+}
+
 async function getAllRequestsInternal(filters: RequestFilters = {}): Promise<NormalizedRequest[]> {
-  const wxRequests = (await getHookArray("__WMPF_MCP_WX_REQUESTS__")).map(normalizeWxRequest);
+  const wxRequests = (await getHookArray("__WMPF_MCP_WX_REQUESTS__", true)).map(normalizeWxRequest);
   const httpRequests = (await getHookArray("__WMPF_MCP_HTTP_REQUESTS__")).map(normalizeHttpRequest);
   const legacyRequests = (await getHookArray("__WMPF_MCP_REQUESTS__")).map(normalizeHttpRequest);
   const all = [...buildCdpRequests(), ...wxRequests, ...httpRequests, ...legacyRequests].sort((a, b) =>
@@ -1157,6 +1391,133 @@ function searchRuntimeKeywordsExpression(keywords: string[], maxLength: number):
   })()`;
 }
 
+function inspectVuexStoreExpression(maxLength: number): string {
+  return `(() => {
+    const maxLength = ${maxLength};
+    const cut = value => {
+      try {
+        const text = typeof value === "string" ? value : JSON.stringify(value);
+        return String(text ?? "").slice(0, maxLength);
+      } catch (e) {
+        return String(value).slice(0, maxLength);
+      }
+    };
+    const clone = value => {
+      try { return JSON.parse(JSON.stringify(value)); } catch { return cut(value); }
+    };
+    const findStore = () => {
+      const candidates = [];
+      try { if (typeof require === "function") candidates.push({ source: 'require("store/index.js").store', value: require("store/index.js")?.store }); } catch {}
+      for (const key of Object.keys(globalThis)) {
+        try {
+          const value = globalThis[key];
+          if (value && typeof value === "object" && value.state && typeof value.commit === "function") {
+            candidates.push({ source: "globalThis." + key, value });
+          }
+          if (value && typeof value === "object" && value.store?.state && typeof value.store?.commit === "function") {
+            candidates.push({ source: "globalThis." + key + ".store", value: value.store });
+          }
+        } catch {}
+      }
+      return candidates.find(item => item.value && item.value.state && typeof item.value.commit === "function");
+    };
+    const found = findStore();
+    if (!found) return { ok: false, error: "Vuex-like store not found in appservice context" };
+    const store = found.value;
+    if (!globalThis.__WMPF_MCP_VUEX_SNAPSHOT__) {
+      globalThis.__WMPF_MCP_VUEX_SNAPSHOT__ = clone(store.state);
+    }
+    return {
+      ok: true,
+      source: found.source,
+      statePreview: cut(store.state),
+      stateKeys: store.state && typeof store.state === "object" ? Object.keys(store.state).slice(0, 120) : [],
+      getters: store.getters && typeof store.getters === "object" ? Object.keys(store.getters).slice(0, 120) : [],
+      mutations: store._mutations && typeof store._mutations === "object" ? Object.keys(store._mutations).slice(0, 200) : [],
+      actions: store._actions && typeof store._actions === "object" ? Object.keys(store._actions).slice(0, 200) : [],
+      snapshotSaved: Boolean(globalThis.__WMPF_MCP_VUEX_SNAPSHOT__)
+    };
+  })()`;
+}
+
+function patchVuexStateExpression(pathValue: string, value: unknown, dryRun: boolean, requireConfirm: boolean, commitType?: string, payload?: unknown): string {
+  return `(() => {
+    const pathValue = ${js(pathValue)};
+    const nextValue = ${js(value)};
+    const dryRun = ${dryRun};
+    const requireConfirm = ${requireConfirm};
+    const commitType = ${commitType ? js(commitType) : "null"};
+    const payload = ${payload === undefined ? "undefined" : js(payload)};
+    const clone = value => { try { return JSON.parse(JSON.stringify(value)); } catch { return value; } };
+    const findStore = () => {
+      try { const store = typeof require === "function" ? require("store/index.js")?.store : null; if (store?.state && typeof store.commit === "function") return store; } catch {}
+      for (const key of Object.keys(globalThis)) {
+        try {
+          const value = globalThis[key];
+          if (value?.state && typeof value.commit === "function") return value;
+          if (value?.store?.state && typeof value.store.commit === "function") return value.store;
+        } catch {}
+      }
+      return null;
+    };
+    const getByPath = (root, pathText) => pathText.split(".").filter(Boolean).reduce((obj, key) => obj?.[key], root);
+    const setByPath = (root, pathText, value) => {
+      const parts = pathText.split(".").filter(Boolean);
+      const last = parts.pop();
+      const parent = parts.reduce((obj, key) => obj?.[key], root);
+      if (!parent || !last) throw new Error("Invalid state path: " + pathText);
+      parent[last] = value;
+    };
+    const store = findStore();
+    if (!store) return { ok: false, error: "Vuex-like store not found" };
+    if (!globalThis.__WMPF_MCP_VUEX_SNAPSHOT__) globalThis.__WMPF_MCP_VUEX_SNAPSHOT__ = clone(store.state);
+    const before = commitType ? null : clone(getByPath(store.state, pathValue));
+    if (dryRun || !requireConfirm) {
+      return { ok: true, dryRun: true, requireConfirm, warning: "No state changed. Set dryRun=false and requireConfirm=true to mutate authorized local runtime state.", sourcePath: pathValue, before, nextValue, commitType, payload };
+    }
+    if (commitType) {
+      store.commit(commitType, payload === undefined ? nextValue : payload);
+    } else {
+      setByPath(store.state, pathValue, nextValue);
+    }
+    const after = commitType ? clone(store.state) : clone(getByPath(store.state, pathValue));
+    return { ok: true, dryRun: false, sourcePath: pathValue, before, after, commitType, snapshotSaved: Boolean(globalThis.__WMPF_MCP_VUEX_SNAPSHOT__) };
+  })()`;
+}
+
+function restoreVuexStateExpression(dryRun: boolean, requireConfirm: boolean): string {
+  return `(() => {
+    const dryRun = ${dryRun};
+    const requireConfirm = ${requireConfirm};
+    const clone = value => { try { return JSON.parse(JSON.stringify(value)); } catch { return value; } };
+    const findStore = () => {
+      try { const store = typeof require === "function" ? require("store/index.js")?.store : null; if (store?.state && typeof store.commit === "function") return store; } catch {}
+      for (const key of Object.keys(globalThis)) {
+        try {
+          const value = globalThis[key];
+          if (value?.state && typeof value.commit === "function") return value;
+          if (value?.store?.state && typeof value.store.commit === "function") return value.store;
+        } catch {}
+      }
+      return null;
+    };
+    const store = findStore();
+    if (!store) return { ok: false, error: "Vuex-like store not found" };
+    const snapshot = globalThis.__WMPF_MCP_VUEX_SNAPSHOT__;
+    if (!snapshot) return { ok: false, error: "No Vuex snapshot saved. Run inspect_vuex_store first." };
+    if (dryRun || !requireConfirm) {
+      return { ok: true, dryRun: true, requireConfirm, warning: "No state changed. Set dryRun=false and requireConfirm=true to restore snapshot.", snapshotPreview: clone(snapshot) };
+    }
+    if (typeof store.replaceState === "function") {
+      store.replaceState(clone(snapshot));
+    } else {
+      Object.keys(store.state).forEach(key => delete store.state[key]);
+      Object.assign(store.state, clone(snapshot));
+    }
+    return { ok: true, dryRun: false, restored: true, statePreview: clone(store.state) };
+  })()`;
+}
+
 function buildReplayPlan(req: NormalizedRequest) {
   const volatileHeaderRegex = /^(cookie|authorization|x-request-id|trace|referer|origin|host|content-length|accept-encoding|connection)$/i;
   const headers = Object.keys(req.requestHeaders);
@@ -1474,21 +1835,48 @@ function registerTools(server: McpServer): void {
   server.registerTool("connect_wmpf", { description: "Connect to local WMPFDebugger CDP WebSocket.", inputSchema: { wsUrl: z.string().url().optional().default(DEFAULT_CDP_WS_URL) } }, async ({ wsUrl }) =>
     safeTool(async () => {
       const connection = await cdp.connect(wsUrl);
+      selectedAppservice = undefined;
+      attachedTargets.clear();
       const runtime = await cdp.enableRuntime().then(result => ({ ok: true, result }), error => ({ ok: false, error: errorMessage(error) }));
       const network = await cdp.enableNetwork().then(result => ({ ok: true, result }), error => ({ ok: false, error: errorMessage(error) }));
       return { ok: true, ...connection, runtime, network };
     })
   );
 
-  server.registerTool("cdp_call", { description: "Call an arbitrary CDP method.", inputSchema: { method: z.string().min(1), params: z.record(z.unknown()).optional().default({}) } }, async ({ method, params }) =>
+  server.registerTool("select_appservice_context", { description: "Auto-detect and select the appservice Runtime execution context.", inputSchema: { force: z.boolean().optional().default(false) } }, async ({ force }) =>
+    safeTool(async () => ({ ok: true, selected: await selectAppserviceContext(force), targets: await getTargets(), contexts: cdp.getRuntimeContexts() }))
+  );
+
+  server.registerTool("cdp_call", { description: "Call an arbitrary CDP method. Supports flatten sessionId.", inputSchema: { method: z.string().min(1), params: z.record(z.unknown()).optional().default({}), sessionId: z.string().optional() } }, async ({ method, params, sessionId }) =>
     safeTool(async () => {
       requireCdpConnected();
-      return { ok: true, method, result: await cdp.send(method, params) };
+      return { ok: true, method, sessionId, result: await cdp.send(method, params, DEFAULT_MAX_LENGTH, sessionId) };
+    })
+  );
+
+  server.registerTool("cdp_call_target", { description: "Attach to targetId with flatten=true and call a CDP method in that session.", inputSchema: { targetId: z.string().min(1), method: z.string().min(1), params: z.record(z.unknown()).optional().default({}) } }, async ({ targetId, method, params }) =>
+    safeTool(async () => {
+      requireCdpConnected();
+      const sessionId = await attachToTarget(targetId);
+      return { ok: true, targetId, sessionId, method, result: await cdp.send(method, params, DEFAULT_MAX_LENGTH, sessionId) };
     })
   );
 
   server.registerTool("runtime_eval", { description: "Evaluate JavaScript in current runtime.", inputSchema: { expression: z.string().min(1), returnByValue: z.boolean().optional().default(true), awaitPromise: z.boolean().optional().default(true) } }, async ({ expression, returnByValue, awaitPromise }) =>
     safeTool(async () => ({ ok: true, result: await cdp.eval(expression, { returnByValue, awaitPromise }) }))
+  );
+
+  server.registerTool("runtime_eval_appservice", { description: "Evaluate JavaScript in the auto-selected appservice context.", inputSchema: { expression: z.string().min(1), forceSelect: z.boolean().optional().default(false) } }, async ({ expression, forceSelect }) =>
+    safeTool(async () => {
+      const selected = await selectAppserviceContext(forceSelect);
+      const result = await cdp.send(
+        "Runtime.evaluate",
+        { expression, returnByValue: true, awaitPromise: true, contextId: selected.contextId },
+        DEFAULT_MAX_LENGTH,
+        selected.sessionId
+      );
+      return { ok: true, selected, result };
+    })
   );
 
   server.registerTool("dump_runtime_snapshot", { description: "Capture page runtime snapshot for security assessment context.", inputSchema: { maxLength: z.number().int().positive().optional().default(DEFAULT_MAX_LENGTH) } }, async ({ maxLength }) =>
@@ -1553,8 +1941,19 @@ function registerTools(server: McpServer): void {
     safeTool(async () => ({ ok: true, result: await cdp.enableNetwork() }))
   );
 
-  server.registerTool("get_recent_requests", { description: "Return recent CDP Network events.", inputSchema: { limit: z.number().int().positive().optional().default(50) } }, async ({ limit }) =>
-    safeTool(() => ({ ok: true, events: cdp.getRecentRequests(clampLimit(limit, 50, 300)) }))
+  server.registerTool("get_recent_requests", { description: "Return recent CDP Network requests with optional filtering and compact output.", inputSchema: { limit: z.number().int().positive().optional().default(50), domain: z.string().optional(), pathPrefix: z.string().optional(), keyword: z.string().optional(), excludeStatic: z.boolean().optional().default(true), compact: z.boolean().optional().default(true) } }, async ({ limit, domain, pathPrefix, keyword, excludeStatic, compact }) =>
+    safeTool(() => {
+      if (!compact) {
+        const events = cdp.getRecentRequests(clampLimit(limit, 50, 300)).filter(event => !keyword || JSON.stringify(event).toLowerCase().includes(keyword.toLowerCase()));
+        return { ok: true, compact: false, events };
+      }
+
+      let requests = filterRequests(buildCdpRequests(), { limit: 300, domain, pathPrefix, keyword });
+      if (excludeStatic) {
+        requests = requests.filter(req => !isStaticNoiseRequest(req));
+      }
+      return { ok: true, compact: true, requests: requests.slice(-clampLimit(limit, 50, 300)).map(compactRequest) };
+    })
   );
 
   server.registerTool("get_response_body", { description: "Return CDP Network.getResponseBody.", inputSchema: { requestId: z.string().min(1) } }, async ({ requestId }) =>
@@ -1586,7 +1985,11 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool("hook_wx_request", { description: "Inject non-mutating wx.request hook.", inputSchema: {} }, async () =>
-    safeTool(async () => evalJson(hookWxRequestExpression()))
+    safeTool(async () => {
+      const selected = await selectAppserviceContext(false);
+      const result = await evalInAppservice(hookWxRequestExpression());
+      return { ok: true, selected, result };
+    })
   );
 
   server.registerTool("hook_fetch_and_xhr", { description: "Inject non-mutating fetch/XHR hooks with response capture.", inputSchema: {} }, async () =>
@@ -1710,6 +2113,40 @@ function registerTools(server: McpServer): void {
     })
   );
 
+  server.registerTool("inspect_vuex_store", { description: "Inspect Vuex-like store in appservice and save an original state snapshot.", inputSchema: { maxLength: z.number().int().positive().optional().default(DEFAULT_MAX_LENGTH), forceSelect: z.boolean().optional().default(false) } }, async ({ maxLength, forceSelect }) =>
+    safeTool(async () => {
+      const selected = await selectAppserviceContext(forceSelect);
+      const result = await evalInAppservice(inspectVuexStoreExpression(clampLimit(maxLength, DEFAULT_MAX_LENGTH, 200_000)));
+      return { ok: true, selected, result };
+    })
+  );
+
+  server.registerTool("patch_vuex_state", { description: "Patch Vuex-like state or commit a mutation in appservice. Defaults to dryRun and requires requireConfirm=true to mutate.", inputSchema: { path: z.string().optional().default(""), value: z.unknown().optional(), commitType: z.string().optional(), payload: z.unknown().optional(), dryRun: z.boolean().optional().default(true), requireConfirm: z.boolean().optional().default(false), forceSelect: z.boolean().optional().default(false) } }, async args =>
+    safeTool(async () => {
+      const selected = await selectAppserviceContext(args.forceSelect);
+      const result = await evalInAppservice(patchVuexStateExpression(args.path, args.value, args.dryRun, args.requireConfirm, args.commitType, args.payload));
+      return {
+        ok: true,
+        selected,
+        result,
+        safety: "默认 dryRun=true；只有 dryRun=false 且 requireConfirm=true 时才会修改授权本地 Runtime 状态。"
+      };
+    })
+  );
+
+  server.registerTool("restore_vuex_state", { description: "Restore Vuex-like state from the snapshot saved by inspect_vuex_store. Defaults to dryRun.", inputSchema: { dryRun: z.boolean().optional().default(true), requireConfirm: z.boolean().optional().default(false), forceSelect: z.boolean().optional().default(false) } }, async ({ dryRun, requireConfirm, forceSelect }) =>
+    safeTool(async () => {
+      const selected = await selectAppserviceContext(forceSelect);
+      const result = await evalInAppservice(restoreVuexStateExpression(dryRun, requireConfirm));
+      return {
+        ok: true,
+        selected,
+        result,
+        safety: "默认 dryRun=true；只有 dryRun=false 且 requireConfirm=true 时才会恢复授权本地 Runtime 状态。"
+      };
+    })
+  );
+
   server.registerTool("find_sign_related_requests", { description: "Find requests containing sign/signature/timestamp/nonce fields.", inputSchema: {} }, async () =>
     safeTool(async () => ({ ok: true, requests: findSignRequestsData(await getAllRequestsInternal({ limit: 500 })) }))
   );
@@ -1728,7 +2165,7 @@ function registerTools(server: McpServer): void {
         apiInventory,
         allRequests: sanitizeSensitive(allRequests),
         console: cdp.getRecentConsole(300),
-        wxRequests: sanitizeSensitive(await getHookArray("__WMPF_MCP_WX_REQUESTS__")),
+        wxRequests: sanitizeSensitive(await getHookArray("__WMPF_MCP_WX_REQUESTS__", true)),
         httpRequests: sanitizeSensitive(await getHookArray("__WMPF_MCP_HTTP_REQUESTS__")),
         findings
       };

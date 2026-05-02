@@ -9,6 +9,7 @@ type CdpResult = Record<string, unknown>;
 
 export interface CdpResponse {
   id?: number;
+  sessionId?: string;
   result?: CdpResult;
   error?: {
     code?: number;
@@ -30,14 +31,26 @@ export interface RuntimeEvalOptions {
   returnByValue?: boolean;
   awaitPromise?: boolean;
   timeoutMs?: number;
+  sessionId?: string;
+  contextId?: number;
 }
 
 export interface CapturedCdpEvent {
   type: string;
   method: string;
   timestamp: string;
+  sessionId?: string;
   params: CdpParams;
 }
+
+export interface CapturedExecutionContext {
+  id: number;
+  sessionId?: string;
+  name?: string;
+  origin?: string;
+  auxData?: unknown;
+  timestamp: string;
+ }
 
 export class WmpfCdpClient {
   private ws?: WebSocket;
@@ -45,6 +58,7 @@ export class WmpfCdpClient {
   private readonly pending = new Map<number, PendingRequest>();
   private readonly recentRequests: CapturedCdpEvent[] = [];
   private readonly recentConsole: CapturedCdpEvent[] = [];
+  private readonly runtimeContexts: CapturedExecutionContext[] = [];
   private currentUrl?: string;
 
   async connect(wsUrl = DEFAULT_CDP_WS_URL): Promise<{ connected: boolean; wsUrl: string; reused: boolean }> {
@@ -83,13 +97,13 @@ export class WmpfCdpClient {
     });
   }
 
-  async send(method: string, params: CdpParams = {}, timeoutMs = DEFAULT_CDP_TIMEOUT_MS): Promise<CdpResult> {
+  async send(method: string, params: CdpParams = {}, timeoutMs = DEFAULT_CDP_TIMEOUT_MS, sessionId?: string): Promise<CdpResult> {
     if (!this.isConnected() || !this.ws) {
       throw new Error("CDP WebSocket is not connected. Call connect_wmpf first.");
     }
 
     const id = this.nextId++;
-    const payload = JSON.stringify({ id, method, params });
+    const payload = JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params });
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -115,7 +129,9 @@ export class WmpfCdpClient {
     const {
       returnByValue = true,
       awaitPromise = true,
-      timeoutMs = DEFAULT_CDP_TIMEOUT_MS
+      timeoutMs = DEFAULT_CDP_TIMEOUT_MS,
+      sessionId,
+      contextId
     } = options;
 
     return this.send(
@@ -123,9 +139,11 @@ export class WmpfCdpClient {
       {
         expression,
         returnByValue,
-        awaitPromise
+        awaitPromise,
+        ...(typeof contextId === "number" ? { contextId } : {})
       },
-      timeoutMs
+      timeoutMs,
+      sessionId
     );
   }
 
@@ -143,6 +161,10 @@ export class WmpfCdpClient {
 
   getRecentConsole(limit = 50): CapturedCdpEvent[] {
     return this.recentConsole.slice(-this.normalizeLimit(limit));
+  }
+
+  getRuntimeContexts(): CapturedExecutionContext[] {
+    return [...this.runtimeContexts];
   }
 
   getRecentRequestsCount(): number {
@@ -206,7 +228,7 @@ export class WmpfCdpClient {
     }
 
     if (message.method && message.params) {
-      this.handleEvent(message.method, message.params);
+      this.handleEvent(message.method, message.params, message.sessionId);
     }
   }
 
@@ -236,13 +258,19 @@ export class WmpfCdpClient {
     pending.resolve(message.result ?? {});
   }
 
-  private handleEvent(method: string, params: CdpParams): void {
+  private handleEvent(method: string, params: CdpParams, sessionId?: string): void {
     const event: CapturedCdpEvent = {
       type: this.eventType(method),
       method,
       timestamp: new Date().toISOString(),
+      sessionId,
       params
     };
+
+    if (method === "Runtime.executionContextCreated") {
+      this.upsertRuntimeContext(params.context as CdpParams | undefined, sessionId, event.timestamp);
+      return;
+    }
 
     if (
       method === "Network.requestWillBeSent" ||
@@ -266,6 +294,28 @@ export class WmpfCdpClient {
     target.push(value);
     if (target.length > MAX_EVENTS) {
       target.splice(0, target.length - MAX_EVENTS);
+    }
+  }
+
+  private upsertRuntimeContext(context: CdpParams | undefined, sessionId: string | undefined, timestamp: string): void {
+    if (!context || typeof context.id !== "number") {
+      return;
+    }
+
+    const next: CapturedExecutionContext = {
+      id: context.id,
+      sessionId,
+      name: typeof context.name === "string" ? context.name : undefined,
+      origin: typeof context.origin === "string" ? context.origin : undefined,
+      auxData: context.auxData,
+      timestamp
+    };
+
+    const index = this.runtimeContexts.findIndex(item => item.id === next.id && item.sessionId === next.sessionId);
+    if (index >= 0) {
+      this.runtimeContexts[index] = next;
+    } else {
+      this.pushLimited(this.runtimeContexts, next);
     }
   }
 
