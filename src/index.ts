@@ -10,8 +10,9 @@ import { CapturedExecutionContext, DEFAULT_CDP_WS_URL, WmpfCdpClient } from "./c
 
 const DEFAULT_MCP_PORT = 43_827;
 const DEFAULT_MAX_LENGTH = 20_000;
+const DEFAULT_MCP_TOKEN = "wmpf-local-token";
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? `${DEFAULT_MCP_PORT}`, 10);
-const MCP_TOKEN = process.env.MCP_TOKEN ?? crypto.randomBytes(24).toString("hex");
+const MCP_TOKEN = process.env.MCP_TOKEN ?? DEFAULT_MCP_TOKEN;
 const cdp = new WmpfCdpClient();
 const attachedTargets = new Map<string, string>();
 let selectedAppservice: AppserviceSelection | undefined;

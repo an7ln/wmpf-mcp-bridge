@@ -31,12 +31,18 @@ npm run dev
 http://127.0.0.1:43827/
 ```
 
+默认 MCP URL：
+
+```text
+http://127.0.0.1:43827/mcp?token=wmpf-local-token
+```
+
 ## Codex 配置
 
 ```toml
 [mcp_servers.wmpf]
 enabled = true
-url = "http://127.0.0.1:43827/mcp?token=启动时输出的token"
+url = "http://127.0.0.1:43827/mcp?token=wmpf-local-token"
 startup_timeout_sec = 20
 tool_timeout_sec = 60
 ```
