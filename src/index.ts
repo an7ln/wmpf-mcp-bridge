@@ -16,6 +16,7 @@ const MCP_TOKEN = process.env.MCP_TOKEN ?? DEFAULT_MCP_TOKEN;
 const cdp = new WmpfCdpClient();
 const attachedTargets = new Map<string, string>();
 let selectedAppservice: AppserviceSelection | undefined;
+let lastAggregationErrors: JsonObject[] = [];
 
 type JsonObject = Record<string, unknown>;
 type RequestSource = "cdp" | "wx" | "fetch" | "xhr";
@@ -413,11 +414,15 @@ function sanitizeSensitive(value: unknown, keyPath = "", depth = 0): unknown {
 
 function toPreview(value: unknown, maxLength = 2_000): unknown {
   const sanitized = sanitizeSensitive(value);
+  if (sanitized === undefined || sanitized === null) {
+    return null;
+  }
+
   if (typeof sanitized === "string") {
     return truncateString(sanitized, maxLength);
   }
 
-  const text = JSON.stringify(sanitized);
+  const text = JSON.stringify(sanitized) ?? String(sanitized);
   if (text.length <= maxLength) {
     return sanitized;
   }
@@ -548,60 +553,64 @@ function buildCdpRequests(): NormalizedRequest[] {
   const grouped = new Map<string, NormalizedRequest>();
 
   for (const event of cdp.getRecentRequests(300)) {
-    const params = event.params as JsonObject;
-    const requestId = String(params.requestId ?? params.loaderId ?? crypto.randomUUID());
-    const existing = grouped.get(requestId);
-    const base: NormalizedRequest =
-      existing ??
-      {
-        id: `cdp:${requestId}`,
-        cdpRequestId: requestId,
-        source: "cdp",
-        method: "GET",
-        url: "",
-        path: "",
-        query: {},
-        requestHeaders: {},
-        requestBodyPreview: undefined,
-        responseHeaders: {},
-        timestamp: event.timestamp,
-        raw: []
-      };
+    try {
+      const params = event.params as JsonObject;
+      const requestId = String(params.requestId ?? params.loaderId ?? crypto.randomUUID());
+      const existing = grouped.get(requestId);
+      const base: NormalizedRequest =
+        existing ??
+        {
+          id: `cdp:${requestId}`,
+          cdpRequestId: requestId,
+          source: "cdp",
+          method: "GET",
+          url: "",
+          path: "",
+          query: {},
+          requestHeaders: {},
+          requestBodyPreview: null,
+          responseHeaders: {},
+          timestamp: event.timestamp,
+          raw: []
+        };
 
-    if (Array.isArray(base.raw)) {
-      base.raw.push(event);
+      if (Array.isArray(base.raw)) {
+        base.raw.push(event);
+      }
+
+      if (event.method === "Network.requestWillBeSent") {
+        const request = params.request as JsonObject | undefined;
+        const url = String(request?.url ?? base.url ?? "");
+        const parsed = parseUrlParts(url);
+        base.url = url;
+        base.path = parsed.path;
+        base.query = parsed.query;
+        base.method = normalizeMethod(request?.method);
+        base.requestHeaders = sanitizeSensitive(normalizeHeaders(request?.headers)) as JsonObject;
+        base.requestBodyRaw = request?.postData;
+        base.requestBodyPreview = toPreview(request?.postData);
+        base.timestamp = event.timestamp;
+      }
+
+      if (event.method === "Network.responseReceived") {
+        const response = params.response as JsonObject | undefined;
+        const url = String(response?.url ?? base.url ?? "");
+        const parsed = parseUrlParts(url);
+        base.url = base.url || url;
+        base.path = base.path || parsed.path;
+        base.query = Object.keys(base.query).length ? base.query : parsed.query;
+        base.statusCode = typeof response?.status === "number" ? response.status : base.statusCode;
+        base.responseHeaders = sanitizeSensitive(normalizeHeaders(response?.headers)) as JsonObject;
+      }
+
+      if (event.method === "Network.loadingFinished" && typeof params.encodedDataLength === "number") {
+        base.responseBodyPreview ??= `[${params.encodedDataLength} encoded bytes; call get_request_detail for body if supported]`;
+      }
+
+      grouped.set(requestId, base);
+    } catch (error) {
+      recordAggregationError("cdp_event", error, event);
     }
-
-    if (event.method === "Network.requestWillBeSent") {
-      const request = params.request as JsonObject | undefined;
-      const url = String(request?.url ?? base.url ?? "");
-      const parsed = parseUrlParts(url);
-      base.url = url;
-      base.path = parsed.path;
-      base.query = parsed.query;
-      base.method = normalizeMethod(request?.method);
-      base.requestHeaders = sanitizeSensitive(normalizeHeaders(request?.headers)) as JsonObject;
-      base.requestBodyRaw = request?.postData;
-      base.requestBodyPreview = toPreview(request?.postData);
-      base.timestamp = event.timestamp;
-    }
-
-    if (event.method === "Network.responseReceived") {
-      const response = params.response as JsonObject | undefined;
-      const url = String(response?.url ?? base.url ?? "");
-      const parsed = parseUrlParts(url);
-      base.url = base.url || url;
-      base.path = base.path || parsed.path;
-      base.query = Object.keys(base.query).length ? base.query : parsed.query;
-      base.statusCode = typeof response?.status === "number" ? response.status : base.statusCode;
-      base.responseHeaders = sanitizeSensitive(normalizeHeaders(response?.headers)) as JsonObject;
-    }
-
-    if (event.method === "Network.loadingFinished" && typeof params.encodedDataLength === "number") {
-      base.responseBodyPreview ??= `[${params.encodedDataLength} encoded bytes; call get_request_detail for body if supported]`;
-    }
-
-    grouped.set(requestId, base);
   }
 
   return [...grouped.values()].filter(req => req.url || req.path);
@@ -680,6 +689,34 @@ function normalizeHttpRequest(item: JsonObject): NormalizedRequest {
   };
 }
 
+function recordAggregationError(source: string, error: unknown, raw?: unknown): void {
+  lastAggregationErrors.push({
+    source,
+    error: errorMessage(error),
+    rawPreview: raw === undefined ? undefined : toPreview(raw, 1_000)
+  });
+  if (lastAggregationErrors.length > 100) {
+    lastAggregationErrors = lastAggregationErrors.slice(-100);
+  }
+}
+
+function safeNormalizeRequests<T>(
+  source: string,
+  items: T[],
+  normalizer: (item: T) => NormalizedRequest
+): NormalizedRequest[] {
+  const requests: NormalizedRequest[] = [];
+  for (const item of items) {
+    try {
+      requests.push(normalizer(item));
+    } catch (error) {
+      recordAggregationError(source, error, item);
+    }
+  }
+
+  return requests;
+}
+
 function filterRequests(requests: NormalizedRequest[], filters: RequestFilters): NormalizedRequest[] {
   const keyword = filters.keyword?.toLowerCase();
   const domain = filters.domain?.toLowerCase();
@@ -738,10 +775,17 @@ function compactRequest(req: NormalizedRequest): JsonObject {
 }
 
 async function getAllRequestsInternal(filters: RequestFilters = {}): Promise<NormalizedRequest[]> {
-  const wxRequests = (await getHookArray("__WMPF_MCP_WX_REQUESTS__", true)).map(normalizeWxRequest);
-  const httpRequests = (await getHookArray("__WMPF_MCP_HTTP_REQUESTS__")).map(normalizeHttpRequest);
-  const legacyRequests = (await getHookArray("__WMPF_MCP_REQUESTS__")).map(normalizeHttpRequest);
-  const all = [...buildCdpRequests(), ...wxRequests, ...httpRequests, ...legacyRequests].sort((a, b) =>
+  lastAggregationErrors = [];
+  const wxRequests = safeNormalizeRequests("wx.request", await getHookArray("__WMPF_MCP_WX_REQUESTS__", true), normalizeWxRequest);
+  const httpRequests = safeNormalizeRequests("fetch/xhr", await getHookArray("__WMPF_MCP_HTTP_REQUESTS__"), normalizeHttpRequest);
+  const legacyRequests = safeNormalizeRequests("legacy_fetch/xhr", await getHookArray("__WMPF_MCP_REQUESTS__"), normalizeHttpRequest);
+  let cdpRequests: NormalizedRequest[] = [];
+  try {
+    cdpRequests = buildCdpRequests();
+  } catch (error) {
+    recordAggregationError("cdp", error);
+  }
+  const all = [...cdpRequests, ...wxRequests, ...httpRequests, ...legacyRequests].sort((a, b) =>
     String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? ""))
   );
 
@@ -1949,11 +1993,18 @@ function registerTools(server: McpServer): void {
         return { ok: true, compact: false, events };
       }
 
+      lastAggregationErrors = [];
       let requests = filterRequests(buildCdpRequests(), { limit: 300, domain, pathPrefix, keyword });
       if (excludeStatic) {
         requests = requests.filter(req => !isStaticNoiseRequest(req));
       }
-      return { ok: true, compact: true, requests: requests.slice(-clampLimit(limit, 50, 300)).map(compactRequest) };
+      return {
+        ok: true,
+        compact: true,
+        requests: requests.slice(-clampLimit(limit, 50, 300)).map(compactRequest),
+        skipped: lastAggregationErrors.length,
+        errors: lastAggregationErrors.slice(0, 20)
+      };
     })
   );
 
@@ -2002,7 +2053,10 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool("get_all_requests", { description: "Return normalized CDP + wx.request + fetch/XHR requests.", inputSchema: { limit: z.number().int().positive().optional().default(50), keyword: z.string().optional(), domain: z.string().optional(), pathPrefix: z.string().optional() } }, async args =>
-    safeTool(async () => ({ ok: true, requests: (await getAllRequestsInternal(args)).map(req => sanitizeSensitive(req)) }))
+    safeTool(async () => {
+      const requests = await getAllRequestsInternal(args);
+      return { ok: true, requests: requests.map(req => sanitizeSensitive(req)), skipped: lastAggregationErrors.length, errors: lastAggregationErrors.slice(0, 20) };
+    })
   );
 
   server.registerTool("get_request_detail", { description: "Return one normalized request and try CDP response body when possible.", inputSchema: { requestId: z.string().min(1), maxLength: z.number().int().positive().optional().default(DEFAULT_MAX_LENGTH) } }, async ({ requestId, maxLength }) =>
@@ -2023,7 +2077,10 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool("get_api_inventory", { description: "Generate deduplicated API inventory from all observed requests.", inputSchema: { limit: z.number().int().positive().optional().default(300) } }, async ({ limit }) =>
-    safeTool(async () => ({ ok: true, inventory: summarizeInventory(await getAllRequestsInternal({ limit })) }))
+    safeTool(async () => {
+      const requests = await getAllRequestsInternal({ limit });
+      return { ok: true, inventory: summarizeInventory(requests), skipped: lastAggregationErrors.length, errors: lastAggregationErrors.slice(0, 20) };
+    })
   );
 
   server.registerTool("analyze_auth_surface", { description: "Analyze authentication fields and replay hints.", inputSchema: {} }, async () =>
@@ -2035,7 +2092,10 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool("find_sensitive_data_exposure", { description: "Find sensitive fields in observed requests/responses, masked by default.", inputSchema: {} }, async () =>
-    safeTool(async () => ({ ok: true, findings: findSensitiveDataData(await getAllRequestsInternal({ limit: 500 })) }))
+    safeTool(async () => {
+      const requests = await getAllRequestsInternal({ limit: 500 });
+      return { ok: true, findings: findSensitiveDataData(requests), skipped: lastAggregationErrors.length, errors: lastAggregationErrors.slice(0, 20) };
+    })
   );
 
   server.registerTool("find_upload_surfaces", { description: "Find upload/file related APIs and manual checks.", inputSchema: {} }, async () =>
@@ -2103,7 +2163,7 @@ function registerTools(server: McpServer): void {
       const requestHits = (await getAllRequestsInternal({ limit: 500 }))
         .flatMap(req => keywords.filter(keyword => JSON.stringify(req).toLowerCase().includes(keyword.toLowerCase())).map(keyword => ({ source: "request", keyword, requestId: req.id, path: req.path, context: truncateString(JSON.stringify(toPreview(req, 1_500)), 1_500) })))
         .slice(0, 100);
-      return { ok: true, runtimeHits, requestHits };
+      return { ok: true, runtimeHits, requestHits, skipped: lastAggregationErrors.length, errors: lastAggregationErrors.slice(0, 20) };
     })
   );
 
