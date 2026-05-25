@@ -55,7 +55,8 @@ tool_timeout_sec = 60
 再调用 dump_runtime_snapshot、get_all_requests、get_api_inventory、analyze_auth_surface、find_idor_candidates、find_sensitive_data_exposure、find_upload_surfaces、find_payment_and_order_surfaces、find_sign_related_requests。
 请基于证据生成 generate_security_notes，只输出发现线索和人工验证建议，不直接下漏洞结论。
 ```
-<img width="1271" height="1226" alt="image" src="https://github.com/user-attachments/assets/26cd0c6d-d882-4988-9989-00a07107c778" />
+<img width="1050" height="1208" alt="image" src="https://github.com/user-attachments/assets/12dbbb6b-28e2-4609-b1ae-278f3a838980" />
+
 <img width="837" height="1086" alt="image" src="https://github.com/user-attachments/assets/8140f4fb-5ee7-4cf7-82c3-c7c721d88e3e" />
 
 
