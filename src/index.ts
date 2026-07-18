@@ -11,6 +11,11 @@ import { CapturedExecutionContext, DEFAULT_CDP_WS_URL, WmpfCdpClient } from "./c
 const DEFAULT_MCP_PORT = 43_827;
 const DEFAULT_MAX_LENGTH = 20_000;
 const DEFAULT_MCP_TOKEN = "wmpf-local-token";
+const MCP_SERVER_INSTRUCTIONS = [
+  "When the user says wmpf, wmpf-mcp, WMPFDebugger, 微信小程序调试、逆向或安全评估, immediately call wmpf_start. Do not begin with shell, browser, or manual CDP target discovery. wmpf_start connects ws://127.0.0.1:62000, selects the appservice context, installs passive request hooks, and returns the next tools.",
+  "Use runtime_eval_appservice for wx, require, getCurrentPages, getApp, and Vuex/store access. Use runtime_eval only for page DOM/window work. Use get_recent_requests, get_all_requests, and get_api_inventory for traffic analysis.",
+  "All work is for the authorized local WMPFDebugger session. Mutation helpers default to dry-run and require explicit confirmation. If a tool is deferred or hidden, search tools using the query 'wmpf <task>'."
+].join(" ");
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? `${DEFAULT_MCP_PORT}`, 10);
 const MCP_TOKEN = process.env.MCP_TOKEN ?? DEFAULT_MCP_TOKEN;
 const cdp = new WmpfCdpClient();
@@ -1866,11 +1871,75 @@ function securityNotesMarkdown(pageInfo: unknown, inventory: ReturnType<typeof s
 }
 
 function registerTools(server: McpServer): void {
+  server.registerTool("wmpf_start", {
+    description: "PRIMARY WMPF ENTRYPOINT. Call this first whenever the user mentions wmpf, wmpf-mcp, WMPFDebugger, WeChat mini-program debugging, reverse engineering, or authorized mini-program security assessment. It connects CDP, selects appservice, installs passive request hooks, and returns next-step guidance.",
+    inputSchema: {
+      wsUrl: z.string().url().optional().default(DEFAULT_CDP_WS_URL),
+      enableHooks: z.boolean().optional().default(true),
+      captureSnapshot: z.boolean().optional().default(true),
+      forceContextSelect: z.boolean().optional().default(false)
+    }
+  }, async ({ wsUrl, enableHooks, captureSnapshot, forceContextSelect }) =>
+    safeTool(async () => {
+      const wasConnected = cdp.isConnected();
+      const connection = await cdp.connect(wsUrl);
+      if (!wasConnected) {
+        selectedAppservice = undefined;
+        attachedTargets.clear();
+      }
+
+      const runtime = await cdp.enableRuntime().then(
+        result => ({ ok: true, result }),
+        error => ({ ok: false, error: errorMessage(error) })
+      );
+      const network = await cdp.enableNetwork().then(
+        result => ({ ok: true, result }),
+        error => ({ ok: false, error: errorMessage(error) })
+      );
+      const appservice = await selectAppserviceContext(forceContextSelect).then(
+        selected => ({ ok: true, selected }),
+        error => ({ ok: false, error: errorMessage(error) })
+      );
+
+      let wxHook: JsonObject = { ok: false, skipped: true };
+      let httpHook: JsonObject = { ok: false, skipped: true };
+      if (enableHooks) {
+        wxHook = await evalInAppservice<JsonObject>(hookWxRequestExpression()).catch(error => ({ ok: false, error: errorMessage(error) }));
+        httpHook = await evalJson<JsonObject>(hookFetchXhrExpression()).catch(error => ({ ok: false, error: errorMessage(error) }));
+      }
+
+      const snapshot = captureSnapshot
+        ? await evalJson(runtimeSnapshotExpression(8_000)).catch(error => ({ error: errorMessage(error) }))
+        : { skipped: true };
+
+      return {
+        ok: true,
+        entrypoint: "wmpf_start",
+        connection,
+        runtime,
+        network,
+        appservice,
+        hooks: { wxRequest: wxHook, fetchAndXhr: httpHook },
+        snapshot,
+        recommendedNextTools: [
+          "get_recent_requests",
+          "get_all_requests",
+          "get_api_inventory",
+          "runtime_eval_appservice",
+          "analyze_auth_surface",
+          "generate_security_notes"
+        ]
+      };
+    })
+  );
+
   server.registerTool("status", { description: "Return MCP bridge status and CDP connection state.", inputSchema: {} }, async () =>
     safeTool(() => ({
       ok: true,
       mcp: "running",
+      primaryEntrypoint: "wmpf_start",
       cdpConnected: cdp.isConnected(),
+      appserviceSelected: selectedAppservice ?? null,
       defaultCdpUrl: DEFAULT_CDP_WS_URL,
       recentRequestsCount: cdp.getRecentRequestsCount(),
       recentConsoleCount: cdp.getRecentConsoleCount()
@@ -2259,6 +2328,8 @@ function createServer(): McpServer {
   const server = new McpServer({
     name: "wmpf-mcp-bridge",
     version: "0.1.0"
+  }, {
+    instructions: MCP_SERVER_INSTRUCTIONS
   });
 
   registerTools(server);
@@ -2299,7 +2370,7 @@ app.get("/", (_req, res) => {
       "tool_timeout_sec = 60",
       "",
       "Recommended first prompt:",
-      "使用 wmpf MCP，调用 status、connect_wmpf、hook_wx_request、hook_fetch_and_xhr、dump_runtime_snapshot，然后用 get_api_inventory 和 generate_security_notes 整理接口资产与安全评估线索。"
+      "使用 wmpf MCP，立即调用 wmpf_start；随后用 get_recent_requests、get_api_inventory 和 generate_security_notes 整理接口资产与安全评估线索。"
     ].join("\n")
   );
 });

@@ -50,8 +50,8 @@ tool_timeout_sec = 60
 ## 建议测试提示词
 
 ```text
-使用 wmpf MCP，先调用 status，然后 connect_wmpf 连接 ws://127.0.0.1:62000。
-随后调用 hook_wx_request 和 hook_fetch_and_xhr，打开当前小程序页面并操作关键业务流程。
+使用 wmpf MCP，先调用 wmpf_start。它会连接 ws://127.0.0.1:62000、选择 appservice context，并安装 wx.request/fetch/XHR 被动 hook。
+随后打开当前小程序页面并操作关键业务流程。
 再调用 dump_runtime_snapshot、get_all_requests、get_api_inventory、analyze_auth_surface、find_idor_candidates、find_sensitive_data_exposure、find_upload_surfaces、find_payment_and_order_surfaces、find_sign_related_requests。
 请基于证据生成 generate_security_notes，只输出发现线索和人工验证建议，不直接下漏洞结论。
 ```
@@ -60,10 +60,25 @@ tool_timeout_sec = 60
 <img width="837" height="1086" alt="image" src="https://github.com/user-attachments/assets/8140f4fb-5ee7-4cf7-82c3-c7c721d88e3e" />
 
 
+## Agent 工具发现
+
+MCP 初始化响应包含 server-wide `instructions`。Codex 看到 `wmpf`、`wmpf-mcp`、`WMPFDebugger`、微信小程序调试/逆向/安全评估时，应直接调用 `wmpf_start`，不需要先手工枚举 CDP Target 或逐个查找底层工具。
+
+`wmpf_start` 是稳定的单入口，会完成：
+
+1. 连接本地 CDP WebSocket。
+2. 启用 Runtime 和 Network。
+3. 自动选择 appservice execution context。
+4. 注入 `wx.request`、fetch 和 XHR 被动 hook。
+5. 返回页面快照和推荐的下一步工具。
+
+如果客户端把部分 MCP 工具延迟加载，Agent 应使用 tool search 查询 `wmpf <任务>`。核心工作流不再依赖 Agent 自己猜测入口。
+
 ## 工具列表
 
 ### 基础连接与 CDP
 
+- `wmpf_start`：首选单入口。遇到 wmpf 相关任务时优先调用，自动连接、选择 appservice、安装 hook，并返回下一步建议。
 - `status`：查看 MCP 和 CDP 连接状态。
 - `connect_wmpf`：连接本机 WMPFDebugger CDP WebSocket，并启用 Runtime/Network。
 - `select_appservice_context`：自动枚举 Target、flatten attach，并选择包含 `wx.request` / `require` / `getCurrentPages` 的 appservice Runtime context。
